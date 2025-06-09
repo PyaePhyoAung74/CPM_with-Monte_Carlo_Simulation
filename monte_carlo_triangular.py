@@ -18,7 +18,7 @@ duration_entries = []
 dependencies_entries = []
 task_count_entry = tk.Entry(root)
 simulations_entry = tk.Entry(root)
-seed_entry = tk.Entry(root)  # New entry for random seed
+seed_entry = tk.Entry(root)
 
 DB_PARAMS = {
     "dbname": "cpm_project",
@@ -106,7 +106,6 @@ def find_critical_path(tasks_data, dependencies_data, es, ef, slack):
         try:
             topo_order = list(nx.topological_sort(G))
             critical_path = [task for task in topo_order if task in critical_tasks]
-            # Verify path connectivity
             valid_path = True
             for i in range(len(critical_path) - 1):
                 if not G.has_edge(critical_path[i], critical_path[i + 1]) and critical_path[i + 1] not in dependencies_data.get(critical_path[i], []):
@@ -118,7 +117,6 @@ def find_critical_path(tasks_data, dependencies_data, es, ef, slack):
             critical_path = []
     
     if not critical_path:
-        # Fallback: longest path based on duration
         try:
             critical_path = nx.dag_longest_path(G, weight=lambda u, v: tasks_data[v]['duration'])
         except:
@@ -126,7 +124,11 @@ def find_critical_path(tasks_data, dependencies_data, es, ef, slack):
     
     return critical_path
 
-def monte_carlo_cpm(tasks_data, dependencies_data, num_simulations, seed=None):
+def calculate_pert_duration(task_info):
+    """Calculate PERT duration for a task."""
+    return (task_info['min'] + 4 * task_info['most_likely'] + task_info['max']) / 6
+
+def monte_carlo_cpm(tasks_data, dependencies_data, num_simulations=100, seed=None):
     if seed is not None:
         np.random.seed(seed)
     
@@ -134,17 +136,21 @@ def monte_carlo_cpm(tasks_data, dependencies_data, num_simulations, seed=None):
     critical_paths = {}
     task_criticality = {task_id: 0 for task_id in tasks_data}
     avg_durations = {task_id: [] for task_id in tasks_data}
+    slack_distributions = {task_id: [] for task_id in tasks_data}
+    slack_frequency = {task_id: {'zero': 0, 'non_zero': 0} for task_id in tasks_data}
     sample_simulations = []
     
-    task_params = {task_id: (info['min'], info['most_likely'], info['max'])
-                   for task_id, info in tasks_data.items()}
-    
     for i in range(num_simulations):
-        sim_tasks_data = {task_id: {'name': info['name'],
-                                   'duration': np.random.triangular(*task_params[task_id])}
-                         for task_id, info in tasks_data.items()}
-        for task_id, dur in sim_tasks_data.items():
-            avg_durations[task_id].append(dur['duration'])
+        sim_tasks_data = {}
+        for task_id, info in tasks_data.items():
+            # Use triangular distribution to sample duration
+            duration = np.random.triangular(
+                left=info['min'],
+                mode=info['most_likely'],
+                right=info['max']
+            )
+            sim_tasks_data[task_id] = {'name': info['name'], 'duration': duration}
+            avg_durations[task_id].append(duration)
         
         try:
             es, ef = calculate_earliest_start_finish(sim_tasks_data, dependencies_data)
@@ -160,6 +166,13 @@ def monte_carlo_cpm(tasks_data, dependencies_data, num_simulations, seed=None):
         
         for task_id in critical_path:
             task_criticality[task_id] += 1
+        
+        for task_id in tasks_data:
+            slack_distributions[task_id].append(slack[task_id])
+            if abs(slack[task_id]) < 1e-6:
+                slack_frequency[task_id]['zero'] += 1
+            else:
+                slack_frequency[task_id]['non_zero'] += 1
         
         if i < 5:
             sample_simulations.append({
@@ -182,8 +195,15 @@ def monte_carlo_cpm(tasks_data, dependencies_data, num_simulations, seed=None):
     mode_duration = float(stats.mode(project_durations, keepdims=True)[0])
     extra_percentiles = np.percentile(project_durations, [10, 25, 75])
     avg_durations = {task_id: np.mean(durs) for task_id, durs in avg_durations.items()}
+    slack_stats = {
+        task_id: {
+            'mean': np.mean(slacks),
+            'std': np.std(slacks),
+            'min': np.min(slacks),
+            'max': np.max(slacks)
+        } for task_id, slacks in slack_distributions.items()
+    }
     
-    # Debugging output for critical path frequencies
     with open("critical_path_log.txt", "w") as f:
         f.write("Critical Path Frequencies:\n")
         for cp, count in sorted(critical_paths.items(), key=lambda x: x[1], reverse=True):
@@ -191,92 +211,13 @@ def monte_carlo_cpm(tasks_data, dependencies_data, num_simulations, seed=None):
     
     return (project_durations, critical_paths, sample_simulations,
             task_criticality, mean_duration, std_duration, percentiles,
-            avg_durations, median_duration, mode_duration, extra_percentiles)
-
-def on_save_and_calculate():
-    try:
-        conn = connect_db()
-        if not conn:
-            return
-        cur = conn.cursor()
-        cur.execute("DELETE FROM monte_carlo_tasks")
-        
-        task_count = int(task_count_entry.get() or 0)
-        num_simulations = int(simulations_entry.get() or 1000)
-        seed = seed_entry.get()
-        seed = int(seed) if seed.strip() else None
-        
-        if task_count <= 0:
-            raise ValueError("Number of tasks must be positive.")
-        if num_simulations <= 0:
-            raise ValueError("Number of simulations must be positive.")
-        if num_simulations > 10000:
-            raise ValueError("Number of simulations cannot exceed 10,000.")
-        
-        tasks_data = {}
-        dependencies_data = {}
-        task_ids = []
-        
-        for i in range(task_count):
-            if i < 26:
-                task_id = chr(ord('A') + i)
-            else:
-                first_char = chr(ord('A') + ((i - 26) // 26))
-                second_char = chr(ord('A') + ((i - 26) % 26))
-                task_id = first_char + second_char
-            task_ids.append(task_id)
-        
-        for i in range(task_count):
-            task_name = task_entries[i].get()
-            min_dur = duration_entries[i*3].get()
-            most_likely_dur = duration_entries[i*3+1].get()
-            max_dur = duration_entries[i*3+2].get()
-            task_deps = dependencies_entries[i].get().split(',')
-            
-            if not task_name or not min_dur or not most_likely_dur or not max_dur:
-                raise ValueError(f"Task {i+1} fields cannot be empty.")
-            
-            min_dur, most_likely_dur, max_dur = int(min_dur), int(most_likely_dur), int(max_dur)
-            
-            # Validate triangular distribution parameters
-            if not (min_dur <= most_likely_dur <= max_dur):
-                raise ValueError(f"Task {i+1}: Must have min ({min_dur}) <= most likely ({most_likely_dur}) <= max ({max_dur})")
-            
-            task_id = task_ids[i]
-            tasks_data[task_id] = {
-                'name': task_name,
-                'min': min_dur,
-                'most_likely': most_likely_dur,
-                'max': max_dur
-            }
-            dependencies_data[task_id] = [dep.strip() for dep in task_deps if dep.strip()]
-            
-            # Validate dependencies
-            for dep in dependencies_data[task_id]:
-                if dep not in task_ids:
-                    raise ValueError(f"Invalid dependency {dep} for task {task_id}")
-            
-            deps_str = ','.join(dependencies_data[task_id]) if dependencies_data[task_id] else ''
-            cur.execute(
-                "INSERT INTO monte_carlo_tasks (task_id, name, min_duration, most_likely_duration, max_duration, dependencies) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (task_id, task_name, min_dur, most_likely_dur, max_dur, deps_str)
-            )
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        results = monte_carlo_cpm(tasks_data, dependencies_data, num_simulations, seed)
-        display_monte_carlo_results(*results, tasks_data)
-    except ValueError as ve:
-        messagebox.showerror("Input Error", str(ve))
-    except Exception as e:
-        messagebox.showerror("Error", f"An error occurred: {e}")
+            avg_durations, median_duration, mode_duration, extra_percentiles,
+            slack_stats, slack_frequency)
 
 def display_monte_carlo_results(project_durations, critical_paths, sample_simulations,
                                task_criticality, mean_duration, std_duration, percentiles,
-                               avg_durations, median_duration, mode_duration, extra_percentiles, tasks_data):
+                               avg_durations, median_duration, mode_duration, extra_percentiles,
+                               slack_stats, slack_frequency, tasks_data):
     result_window = tk.Toplevel(root)
     result_window.title("Monte Carlo CPM Results")
     result_window.geometry("1200x800")
@@ -300,6 +241,32 @@ def display_monte_carlo_results(project_durations, critical_paths, sample_simula
     result_window.bind_all("<MouseWheel>", _on_mousewheel)
     result_window.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
     result_window.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+    
+    # Key Findings Table
+    tk.Label(scrollable_frame, text="Key Findings", font=("Arial", 12, "bold")).pack(pady=5)
+    key_findings_columns = ("Metric", "Value")
+    key_findings_tree = ttk.Treeview(scrollable_frame, columns=key_findings_columns, show="headings", height=3)
+    key_findings_tree.pack(pady=5)
+    
+    for col in key_findings_columns:
+        key_findings_tree.heading(col, text=col)
+        key_findings_tree.column(col, width=400, anchor="w")
+    
+    most_frequent_cp = max(critical_paths.items(), key=lambda x: x[1])[0] if critical_paths else "None"
+    most_critical_task = max(task_criticality.items(), key=lambda x: x[1])[0] if task_criticality else "None"
+    most_slack_task = max(slack_stats.items(), key=lambda x: x[1]['mean'])[0] if slack_stats else "None"
+    
+    key_findings_data = [
+        ("Most Frequent Critical Path", 
+         f"{most_frequent_cp} ({critical_paths.get(most_frequent_cp, 0)/len(project_durations)*100:.1f}%)"),
+        ("Most Critical Task", 
+         f"{most_critical_task}: {tasks_data[most_critical_task]['name']} ({task_criticality[most_critical_task]/len(project_durations)*100:.1f}% critical)"),
+        ("Task with Most Slack", 
+         f"{most_slack_task}: {tasks_data[most_slack_task]['name']} (Mean Slack: {slack_stats[most_slack_task]['mean']:.2f} days)")
+    ]
+    
+    for metric, value in key_findings_data:
+        key_findings_tree.insert("", "end", values=(metric, value))
     
     tk.Label(scrollable_frame, text=f"Monte Carlo Simulation Results ({len(project_durations)} Simulations)",
              font=("Arial", 12, "bold")).pack(pady=5)
@@ -349,6 +316,38 @@ def display_monte_carlo_results(project_durations, critical_paths, sample_simula
         prob = count / len(project_durations) * 100
         criticality_tree.insert("", "end", values=(task_id, tasks_data[task_id]['name'], count, f"{prob:.1f}%"))
     
+    tk.Label(scrollable_frame, text="Critical Path Variability:", font=("Arial", 10, "bold")).pack(pady=5)
+    variability_columns = ("Task ID", "Name", "Criticality %", "Mean Slack")
+    variability_tree = ttk.Treeview(scrollable_frame, columns=variability_columns, show="headings", height=len(tasks_data))
+    variability_tree.pack(pady=5)
+    
+    for col in variability_columns:
+        variability_tree.heading(col, text=col)
+        variability_tree.column(col, width=200, anchor="center")
+    
+    for task_id in sorted(tasks_data.keys(), key=lambda x: task_criticality[x], reverse=True):
+        crit_percent = task_criticality[task_id] / len(project_durations) * 100
+        mean_slack = slack_stats[task_id]['mean']
+        variability_tree.insert("", "end", values=(
+            task_id, tasks_data[task_id]['name'], f"{crit_percent:.1f}%", f"{mean_slack:.2f} days"
+        ))
+    
+    tk.Label(scrollable_frame, text="Slack Frequency Analysis:", font=("Arial", 10, "bold")).pack(pady=5)
+    slack_freq_columns = ("Task ID", "Name", "Zero Slack %", "Non-Zero Slack %")
+    slack_freq_tree = ttk.Treeview(scrollable_frame, columns=slack_freq_columns, show="headings", height=len(tasks_data))
+    slack_freq_tree.pack(pady=5)
+    
+    for col in slack_freq_columns:
+        slack_freq_tree.heading(col, text=col)
+        slack_freq_tree.column(col, width=200, anchor="center")
+    
+    for task_id in sorted(tasks_data.keys(), key=lambda x: slack_frequency[x]['zero'], reverse=True):
+        zero_percent = slack_frequency[task_id]['zero'] / len(project_durations) * 100
+        non_zero_percent = slack_frequency[task_id]['non_zero'] / len(project_durations) * 100
+        slack_freq_tree.insert("", "end", values=(
+            task_id, tasks_data[task_id]['name'], f"{zero_percent:.1f}%", f"{non_zero_percent:.1f}%"
+        ))
+    
     tk.Label(scrollable_frame, text="Average Task Durations:", font=("Arial", 10, "bold")).pack(pady=5)
     duration_columns = ("Task ID", "Name", "Average Duration")
     duration_tree = ttk.Treeview(scrollable_frame, columns=duration_columns, show="headings", height=len(tasks_data))
@@ -360,6 +359,22 @@ def display_monte_carlo_results(project_durations, critical_paths, sample_simula
     
     for task_id, avg_dur in avg_durations.items():
         duration_tree.insert("", "end", values=(task_id, tasks_data[task_id]['name'], f"{avg_dur:.2f} days"))
+    
+    tk.Label(scrollable_frame, text="Task Slack Statistics:", font=("Arial", 10, "bold")).pack(pady=5)
+    slack_columns = ("Task ID", "Name", "Mean Slack", "Std Slack", "Min Slack", "Max Slack")
+    slack_tree = ttk.Treeview(scrollable_frame, columns=slack_columns, show="headings", height=len(tasks_data))
+    slack_tree.pack(pady=5)
+    
+    for col in slack_columns:
+        slack_tree.heading(col, text=col)
+        slack_tree.column(col, width=150, anchor="center")
+    
+    for task_id, stats in slack_stats.items():
+        slack_tree.insert("", "end", values=(
+            task_id, tasks_data[task_id]['name'],
+            f"{stats['mean']:.2f}", f"{stats['std']:.2f}",
+            f"{stats['min']:.2f}", f"{stats['max']:.2f}"
+        ))
     
     tk.Label(scrollable_frame, text="Sample Simulations (First 5):", font=("Arial", 10, "bold")).pack(pady=5)
     for i, sim in enumerate(sample_simulations):
@@ -394,10 +409,19 @@ def display_monte_carlo_results(project_durations, critical_paths, sample_simula
               command=lambda: draw_histogram(project_durations)).pack(pady=5)
     tk.Button(scrollable_frame, text="Show Task Criticality Chart",
               command=lambda: draw_criticality_chart(task_criticality, tasks_data, project_durations)).pack(pady=5)
+    tk.Button(scrollable_frame, text="Show Task Slack Distribution Chart",
+              command=lambda: draw_slack_distribution_chart(slack_stats, tasks_data)).pack(pady=5)
+    tk.Button(scrollable_frame, text="Show Critical Path Composition Chart",
+              command=lambda: draw_critical_path_composition_chart(critical_paths, tasks_data, project_durations)).pack(pady=5)
     
     def export_to_csv():
         with open("monte_carlo_results.csv", "w", newline='') as f:
             writer = csv.writer(f)
+            writer.writerow(["Key Findings"])
+            writer.writerow(["Metric", "Value"])
+            for metric, value in key_findings_data:
+                writer.writerow([metric, value])
+            writer.writerow([])
             writer.writerow(["Statistic", "Value"])
             writer.writerow(["Mean Duration", f"{mean_duration:.2f}"])
             writer.writerow(["Std Deviation", f"{std_duration:.2f}"])
@@ -410,12 +434,32 @@ def display_monte_carlo_results(project_durations, critical_paths, sample_simula
             writer.writerow(["75th Percentile", f"{extra_percentiles[2]:.2f}"])
             writer.writerow([])
             writer.writerow(["Critical Path", "Frequency", "Percentage"])
-            for cp, count in critical_paths.items():
+            for cp, count in sorted(critical_paths.items(), key=lambda x: x[1], reverse=True):
                 writer.writerow([cp, count, f"{count/len(project_durations)*100:.1f}%"])
             writer.writerow([])
             writer.writerow(["Task ID", "Name", "Criticality Count", "Criticality %"])
-            for task_id, count in task_criticality.items():
+            for task_id, count in sorted(task_criticality.items(), key=lambda x: x[1], reverse=True):
                 writer.writerow([task_id, tasks_data[task_id]['name'], count, f"{count/len(project_durations)*100:.1f}%"])
+            writer.writerow([])
+            writer.writerow(["Task ID", "Name", "Criticality %", "Mean Slack"])
+            for task_id in sorted(tasks_data.keys(), key=lambda x: task_criticality[x], reverse=True):
+                crit_percent = task_criticality[task_id] / len(project_durations) * 100
+                mean_slack = slack_stats[task_id]['mean']
+                writer.writerow([task_id, tasks_data[task_id]['name'], f"{crit_percent:.1f}%", f"{mean_slack:.2f}"])
+            writer.writerow([])
+            writer.writerow(["Task ID", "Name", "Zero Slack %", "Non-Zero Slack %"])
+            for task_id in sorted(tasks_data.keys(), key=lambda x: slack_frequency[x]['zero'], reverse=True):
+                zero_percent = slack_frequency[task_id]['zero'] / len(project_durations) * 100
+                non_zero_percent = slack_frequency[task_id]['non_zero'] / len(project_durations) * 100
+                writer.writerow([task_id, tasks_data[task_id]['name'], f"{zero_percent:.1f}%", f"{non_zero_percent:.1f}%"])
+            writer.writerow([])
+            writer.writerow(["Task ID", "Name", "Mean Slack", "Std Slack", "Min Slack", "Max Slack"])
+            for task_id, stats in slack_stats.items():
+                writer.writerow([
+                    task_id, tasks_data[task_id]['name'],
+                    f"{stats['mean']:.2f}", f"{stats['std']:.2f}",
+                    f"{stats['min']:.2f}", f"{stats['max']:.2f}"
+                ])
         messagebox.showinfo("Export", "Results exported to monte_carlo_results.csv")
     
     tk.Button(scrollable_frame, text="Export Results to CSV", command=export_to_csv).pack(pady=5)
@@ -469,6 +513,74 @@ def draw_criticality_chart(task_criticality, tasks_data, project_durations):
     
     chart_window = tk.Toplevel(root)
     chart_window.title("Task Criticality Chart")
+    canvas = FigureCanvasTkAgg(fig, master=chart_window)
+    canvas.draw()
+    canvas.get_tk_widget().pack()
+
+def draw_slack_distribution_chart(slack_stats, tasks_data):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    task_ids = list(slack_stats.keys())
+    mean_slacks = [stats['mean'] for stats in slack_stats.values()]
+    std_slacks = [stats['std'] for stats in slack_stats.values()]
+    
+    x = range(len(task_ids))
+    bars = ax.bar(x, mean_slacks, yerr=std_slacks, capsize=5, color='lightgreen', edgecolor='black')
+    
+    for bar in bars:
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height, f'{height:.1f}',
+                ha='center', va='bottom', fontsize=8)
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{tid}: {tasks_data[tid]['name']}" for tid in task_ids],
+                      rotation=45, ha='right', fontsize=8)
+    ax.set_title("Task Slack Distribution (Mean ± Std Dev)", fontsize=12)
+    ax.set_xlabel("Tasks", fontsize=10)
+    ax.set_ylabel("Slack (days)", fontsize=10)
+    plt.tight_layout()
+    
+    chart_window = tk.Toplevel(root)
+    chart_window.title("Task Slack Distribution Chart")
+    canvas = FigureCanvasTkAgg(fig, master=chart_window)
+    canvas.draw()
+    canvas.get_tk_widget().pack()
+
+def draw_critical_path_composition_chart(critical_paths, tasks_data, project_durations):
+    if not critical_paths:
+        messagebox.showwarning("Visualization Error", "No critical paths found to visualize.")
+        return
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    top_paths = sorted(critical_paths.items(), key=lambda x: x[1], reverse=True)[:5]
+    num_paths = len(top_paths)
+    
+    task_ids = list(tasks_data.keys())
+    path_counts = {task_id: [0] * num_paths for task_id in task_ids}
+    
+    for idx, (path, count) in enumerate(top_paths):
+        tasks_in_path = path.split(' -> ')
+        for task_id in task_ids:
+            if task_id in tasks_in_path:
+                path_counts[task_id][idx] = count
+    
+    bottom = np.zeros(num_paths)
+    for task_id in task_ids:
+        if any(path_counts[task_id]):
+            ax.bar(range(num_paths), path_counts[task_id], bottom=bottom,
+                   label=f"{task_id}: {tasks_data[task_id]['name']}")
+            bottom += np.array(path_counts[task_id], dtype=float)
+    
+    ax.set_xticks(range(num_paths))
+    ax.set_xticklabels([f"Path {idx+1}\n({count/len(project_durations)*100:.1f}%)"
+                        for idx, (_, count) in enumerate(top_paths)], rotation=45, ha='right')
+    ax.set_title("Task Composition in Top Critical Paths", fontsize=12)
+    ax.set_xlabel("Critical Paths", fontsize=10)
+    ax.set_ylabel("Frequency", fontsize=10)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+    plt.tight_layout()
+    
+    chart_window = tk.Toplevel(root)
+    chart_window.title("Critical Path Composition Chart")
     canvas = FigureCanvasTkAgg(fig, master=chart_window)
     canvas.draw()
     canvas.get_tk_widget().pack()
@@ -639,46 +751,46 @@ def reset_input_fields():
 def load_large_example_project():
     tasks = {}
     task_definitions = [
-        ('A', 'Project Initiation', 1, 2, 3, ''),
-        ('B', 'Requirements Gathering', 3, 5, 7, 'A'),
-        ('C', 'Stakeholder Interviews', 2, 4, 6, 'B'),
-        ('D', 'Requirements Documentation', 4, 6, 8, 'C'),
-        ('E', 'Architecture Design', 5, 7, 10, 'D'),
-        ('F', 'Database Schema Design', 4, 6, 8, 'E'),
-        ('G', 'API Specification', 3, 5, 7, 'E'),
-        ('H', 'UI/UX Wireframing', 3, 4, 6, 'D'),
-        ('I', 'Frontend Development Setup', 2, 3, 5, 'H'),
-        ('J', 'Backend Development Setup', 2, 3, 5, 'G'),
-        ('K', 'Database Implementation', 5, 7, 9, 'F'),
-        ('L', 'API Development', 6, 8, 11, 'G,J'),
-        ('M', 'Frontend Feature 1', 4, 6, 8, 'I'),
-        ('N', 'Frontend Feature 2', 5, 7, 10, 'I'),
-        ('O', 'Backend Feature 1', 6, 8, 12, 'L,K'),
-        ('P', 'Backend Feature 2', 5, 7, 10, 'L,K'),
-        ('Q', 'Integration Testing Preparation', 3, 4, 6, 'O,P'),
-        ('R', 'Frontend Unit Testing', 4, 5, 7, 'M,N'),
-        ('S', 'Backend Unit Testing', 4, 5, 7, 'O,P'),
-        ('T', 'Integration Testing', 6, 8, 10, 'Q,R,S'),
-        ('U', 'Bug Fixing Phase 1', 3, 5, 7, 'T'),
-        ('V', 'Performance Optimization', 4, 6, 8, 'U'),
-        ('W', 'Security Audit', 3, 5, 7, 'U'),
-        ('X', 'User Acceptance Testing', 5, 7, 9, 'V,W'),
-        ('Y', 'Documentation Writing', 4, 6, 8, 'X'),
-        ('Z', 'Training Material Preparation', 3, 4, 6, 'X'),
-        ('AA', 'Deployment Planning', 2, 3, 5, 'X'),
-        ('AB', 'Initial Deployment', 3, 4, 6, 'AA'),
-        ('AC', 'Load Testing', 4, 5, 7, 'AB'),
-        ('AD', 'Final Bug Fixing', 3, 5, 7, 'AC'),
-        ('AE', 'Production Deployment', 2, 3, 4, 'AD'),
-        ('AF', 'Post-Deployment Monitoring', 2, 3, 5, 'AE'),
-        ('AG', 'Customer Training', 3, 4, 6, 'Z,AE'),
-        ('AH', 'Feedback Collection', 2, 3, 4, 'AF'),
-        ('AI', 'Final Adjustments', 3, 4, 6, 'AH'),
-        ('AJ', 'Project Closure', 1, 2, 3, 'AI'),
-        ('AK', 'Marketing Preparation', 4, 6, 8, 'X'),
-        ('AL', 'Launch Event Planning', 3, 5, 7, 'AK'),
-        ('AM', 'Launch Execution', 2, 3, 5, 'AL,AE'),
-        ('AN', 'Post-Launch Review', 2, 3, 4, 'AM'),
+        ('A', 'Инициирование проекта', 1, 2, 3, ''),
+        ('B', 'Сбор требований', 3, 5, 7, 'A'),
+        ('C', 'Интервью с заинтересованными сторонами', 2, 4, 6, 'B'),
+        ('D', 'Документация по требованиям', 4, 6, 8, 'C'),
+        ('E', 'Архитектурный дизайн', 5, 7, 10, 'D'),
+        ('F', 'Проектирование схемы базы данных', 4, 6, 8, 'E'),
+        ('G', 'Спецификация API', 3, 5, 7, 'E'),
+        ('H', 'Создание каркаса пользовательского интерфейса/UX', 3, 4, 6, 'D'),
+        ('I', 'Настройка интерфейсной разработки', 2, 3, 5, 'H'),
+        ('J', 'Настройка серверной части разработки', 2, 3, 5, 'G'),
+        ('K', 'Внедрение базы данных', 5, 7, 9, 'F'),
+        ('L', 'Разработка API', 6, 8, 11, 'G,J'),
+        ('M', 'Функция переднего плана 1', 4, 6, 8, 'I'),
+        ('N', 'Функция переднего плана 2', 5, 7, 10, 'I'),
+        ('O', 'Внутренняя функция 1', 6, 8, 12, 'L,K'),
+        ('P', 'Внутренняя функция 2', 5, 7, 10, 'L,K'),
+        ('Q', 'Подготовка к интеграционному тестированию', 3, 4, 6, 'O,P'),
+        ('R', 'Модульное тестирование интерфейса', 4, 5, 7, 'M,N'),
+        ('S', 'Серверное модульное тестирование', 4, 5, 7, 'O,P'),
+        ('T', 'интеграционное тестирование', 6, 8, 10, 'Q,R,S'),
+        ('U', 'Фаза 1 исправления ошибок', 3, 5, 7, 'T'),
+        ('V', 'Оптимизация производительности', 4, 6, 8, 'U'),
+        ('W', 'Аудит безопасности', 3, 5, 7, 'U'),
+        ('X', 'Приемочное тестирование пользователя', 5, 7, 9, 'V,W'),
+        ('Y', 'Написание документации', 4, 6, 8, 'X'),
+        ('Z', 'Подготовка учебных материалов', 3, 4, 6, 'X'),
+        ('AA', 'Планирование развертывания', 2, 3, 5, 'X'),
+        ('AB', 'Первоначальное развертывание', 3, 4, 6, 'AA'),
+        ('AC', 'Нагрузочное тестирование', 4, 5, 7, 'AB'),
+        ('AD', 'Окончательное исправление ошибки', 3, 5, 7, 'AC'),
+        ('AE', 'Развертывание производства', 2, 3, 4, 'AD'),
+        ('AF', 'Мониторинг после развертывания', 2, 3, 5, 'AE'),
+        ('AG', 'Обучение клиентов', 3, 4, 6, 'Z,AE'),
+        ('AH', 'Сбор отзывов', 2, 3, 4, 'AF'),
+        ('AI', 'Окончательные корректировки', 3, 4, 6, 'AH'),
+        ('AJ', 'Закрытие проекта', 1, 2, 3, 'AI'),
+        ('AK', 'Маркетинговая подготовка', 4, 6, 8, 'X'),
+        ('AL', 'Планирование мероприятий по запуску', 3, 5, 7, 'AK'),
+        ('AM', 'Выполнение запуска', 2, 3, 5, 'AL,AE'),
+        ('AN', 'Обзор после запуска', 2, 3, 4, 'AM'),
     ]
     
     for i, (task_id, name, min_dur, most_likely, max_dur, deps) in enumerate(task_definitions):
@@ -693,9 +805,9 @@ def load_large_example_project():
     task_count_entry.delete(0, tk.END)
     task_count_entry.insert(0, str(len(tasks)))
     simulations_entry.delete(0, tk.END)
-    simulations_entry.insert(0, "1000")
+    simulations_entry.insert(0, "100")
     seed_entry.delete(0, tk.END)
-    seed_entry.insert(0, "42")  # Default seed for reproducibility
+    seed_entry.insert(0, "42")
     create_task_entries()
     
     for i, (task_id, info) in enumerate(tasks.items()):
@@ -705,11 +817,91 @@ def load_large_example_project():
         duration_entries[i*3+2].insert(0, str(info['max']))
         dependencies_entries[i].insert(0, info['deps'])
 
+def on_save_and_calculate():
+    try:
+        conn = connect_db()
+        if not conn:
+            return
+        cur = conn.cursor()
+        cur.execute("DELETE FROM monte_carlo_tasks")
+        
+        task_count = int(task_count_entry.get() or 0)
+        num_simulations = int(simulations_entry.get() or 100)
+        seed = seed_entry.get()
+        seed = int(seed) if seed.strip() else None
+        
+        if task_count <= 0:
+            raise ValueError("Number of tasks must be positive.")
+        if num_simulations <= 0:
+            raise ValueError("Number of simulations must be positive.")
+        if num_simulations > 10000:
+            raise ValueError("Number of simulations cannot exceed 10,000.")
+        
+        tasks_data = {}
+        dependencies_data = {}
+        task_ids = []
+        
+        for i in range(task_count):
+            if i < 26:
+                task_id = chr(ord('A') + i)
+            else:
+                first_char = chr(ord('A') + ((i - 26) // 26))
+                second_char = chr(ord('A') + ((i - 26) % 26))
+                task_id = first_char + second_char
+            task_ids.append(task_id)
+        
+        for i in range(task_count):
+            task_name = task_entries[i].get()
+            min_dur = duration_entries[i*3].get()
+            most_likely_dur = duration_entries[i*3+1].get()
+            max_dur = duration_entries[i*3+2].get()
+            task_deps = dependencies_entries[i].get().split(',')
+            
+            if not task_name or not min_dur or not most_likely_dur or not max_dur:
+                raise ValueError(f"Task {i+1} fields cannot be empty.")
+            
+            min_dur, most_likely_dur, max_dur = int(min_dur), int(most_likely_dur), int(max_dur)
+            
+            if not (min_dur <= most_likely_dur <= max_dur):
+                raise ValueError(f"Task {i+1}: Must have min ({min_dur}) <= most likely ({most_likely_dur}) <= max ({max_dur})")
+            
+            task_id = task_ids[i]
+            tasks_data[task_id] = {
+                'name': task_name,
+                'min': min_dur,
+                'most_likely': most_likely_dur,
+                'max': max_dur
+            }
+            dependencies_data[task_id] = [dep.strip() for dep in task_deps if dep.strip()]
+            
+            for dep in dependencies_data[task_id]:
+                if dep not in task_ids:
+                    raise ValueError(f"Invalid dependency {dep} for task {task_id}")
+            
+            deps_str = ','.join(dependencies_data[task_id]) if dependencies_data[task_id] else ''
+            cur.execute(
+                "INSERT INTO monte_carlo_tasks (task_id, name, min_duration, most_likely_duration, max_duration, dependencies) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (task_id, task_name, min_dur, most_likely_dur, max_dur, deps_str)
+            )
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        results = monte_carlo_cpm(tasks_data, dependencies_data, num_simulations, seed)
+        display_monte_carlo_results(*results, tasks_data)
+    except ValueError as ve:
+        messagebox.showerror("Input Error", str(ve))
+    except Exception as e:
+        messagebox.showerror("Error", f"An error occurred: {e}")
+
 # Initial UI setup
 tk.Label(root, text="Enter the number of tasks:").grid(row=0, column=0, padx=5, pady=5)
 task_count_entry.grid(row=0, column=1, padx=5, pady=5)
 tk.Label(root, text="Number of simulations:").grid(row=1, column=0, padx=5, pady=5)
 simulations_entry.grid(row=1, column=1, padx=5, pady=5)
+simulations_entry.insert(0, "100")
 tk.Label(root, text="Random seed (optional):").grid(row=2, column=0, padx=5, pady=5)
 seed_entry.grid(row=2, column=1, padx=5, pady=5)
 tk.Button(root, text="Create Task Entries", command=create_task_entries).grid(row=0, column=2, columnspan=2, pady=10)
